@@ -41,10 +41,10 @@ namespace raylet {
 
 /// A constructor that initializes a worker pool with
 /// (num_worker_processes * num_workers_per_process) workers for each language.
-WorkerPool::WorkerPool(
-    int num_worker_processes, int num_workers_per_process,
-    int maximum_startup_concurrency, std::shared_ptr<gcs::AsyncGcsClient> gcs_client,
-    const std::unordered_map<Language, std::vector<std::string>> &worker_commands)
+WorkerPool::WorkerPool(int num_worker_processes, int num_workers_per_process,
+                       int maximum_startup_concurrency,
+                       std::shared_ptr<gcs::RedisGcsClient> gcs_client,
+                       const WorkerCommandMap &worker_commands)
     : num_workers_per_process_(num_workers_per_process),
       multiple_for_warning_(std::max(num_worker_processes, maximum_startup_concurrency)),
       maximum_startup_concurrency_(maximum_startup_concurrency),
@@ -120,7 +120,7 @@ int WorkerPool::StartWorkerProcess(const Language &language,
                  << " non-actor workers";
 
   // Extract pointers from the worker command to pass into execvp.
-  std::vector<const char *> worker_command_args;
+  std::vector<std::string> worker_command_args;
   size_t dynamic_option_index = 0;
   for (auto const &token : state.worker_command) {
     const auto option_placeholder =
@@ -129,14 +129,15 @@ int WorkerPool::StartWorkerProcess(const Language &language,
     if (token == option_placeholder) {
       if (!dynamic_options.empty()) {
         RAY_CHECK(dynamic_option_index < dynamic_options.size());
-        worker_command_args.push_back(dynamic_options[dynamic_option_index].c_str());
+        auto options = SplitStrByWhitespaces(dynamic_options[dynamic_option_index]);
+        worker_command_args.insert(worker_command_args.end(), options.begin(),
+                                   options.end());
         ++dynamic_option_index;
       }
     } else {
-      worker_command_args.push_back(token.c_str());
+      worker_command_args.push_back(token);
     }
   }
-  worker_command_args.push_back(nullptr);
 
   pid_t pid = StartProcess(worker_command_args);
   if (pid < 0) {
@@ -152,7 +153,16 @@ int WorkerPool::StartWorkerProcess(const Language &language,
   return -1;
 }
 
-pid_t WorkerPool::StartProcess(const std::vector<const char *> &worker_command_args) {
+pid_t WorkerPool::StartProcess(const std::vector<std::string> &worker_command_args) {
+  if (RAY_LOG_ENABLED(DEBUG)) {
+    std::stringstream stream;
+    stream << "Starting worker process with command:";
+    for (const auto &arg : worker_command_args) {
+      stream << " " << arg;
+    }
+    RAY_LOG(DEBUG) << stream.str();
+  }
+
   // Launch the process to create the worker.
   pid_t pid = fork();
 
@@ -165,35 +175,45 @@ pid_t WorkerPool::StartProcess(const std::vector<const char *> &worker_command_a
   signal(SIGCHLD, SIG_DFL);
 
   // Try to execute the worker command.
-  int rv = execvp(worker_command_args[0],
-                  const_cast<char *const *>(worker_command_args.data()));
+  std::vector<const char *> worker_command_args_str;
+  for (const auto &arg : worker_command_args) {
+    worker_command_args_str.push_back(arg.c_str());
+  }
+  worker_command_args_str.push_back(nullptr);
+  int rv = execvp(worker_command_args_str[0],
+                  const_cast<char *const *>(worker_command_args_str.data()));
+
   // The worker failed to start. This is a fatal error.
   RAY_LOG(FATAL) << "Failed to start worker with return value " << rv << ": "
                  << strerror(errno);
   return 0;
 }
 
-void WorkerPool::RegisterWorker(const std::shared_ptr<Worker> &worker) {
+Status WorkerPool::RegisterWorker(const std::shared_ptr<Worker> &worker) {
   const auto pid = worker->Pid();
-  RAY_LOG(DEBUG) << "Registering worker with pid " << pid;
+  const auto port = worker->Port();
+  RAY_LOG(DEBUG) << "Registering worker with pid " << pid << ", port: " << port;
   auto &state = GetStateForLanguage(worker->GetLanguage());
-  state.registered_workers.insert(std::move(worker));
 
   auto it = state.starting_worker_processes.find(pid);
   if (it == state.starting_worker_processes.end()) {
     RAY_LOG(WARNING) << "Received a register request from an unknown worker " << pid;
-    return;
+    return Status::Invalid("Unknown worker");
   }
   it->second--;
   if (it->second == 0) {
     state.starting_worker_processes.erase(it);
   }
+
+  state.registered_workers.emplace(std::move(worker));
+  return Status::OK();
 }
 
-void WorkerPool::RegisterDriver(const std::shared_ptr<Worker> &driver) {
+Status WorkerPool::RegisterDriver(const std::shared_ptr<Worker> &driver) {
   RAY_CHECK(!driver->GetAssignedTaskId().IsNil());
   auto &state = GetStateForLanguage(driver->GetLanguage());
   state.registered_drivers.insert(std::move(driver));
+  return Status::OK();
 }
 
 std::shared_ptr<Worker> WorkerPool::GetRegisteredWorker(
@@ -243,7 +263,6 @@ void WorkerPool::PushWorker(const std::shared_ptr<Worker> &worker) {
 
 std::shared_ptr<Worker> WorkerPool::PopWorker(const TaskSpecification &task_spec) {
   auto &state = GetStateForLanguage(task_spec.GetLanguage());
-  const auto &actor_id = task_spec.ActorId();
 
   std::shared_ptr<Worker> worker = nullptr;
   int pid = -1;
@@ -280,6 +299,7 @@ std::shared_ptr<Worker> WorkerPool::PopWorker(const TaskSpecification &task_spec
     }
   } else {
     // Code path of actor task.
+    const auto &actor_id = task_spec.ActorId();
     auto actor_entry = state.idle_actor.find(actor_id);
     if (actor_entry != state.idle_actor.end()) {
       worker = std::move(actor_entry->second);
@@ -299,7 +319,7 @@ bool WorkerPool::DisconnectWorker(const std::shared_ptr<Worker> &worker) {
   RAY_CHECK(RemoveWorker(state.registered_workers, worker));
 
   stats::CurrentWorker().Record(
-      0, {{stats::LanguageKey, EnumNameLanguage(worker->GetLanguage())},
+      0, {{stats::LanguageKey, Language_Name(worker->GetLanguage())},
           {stats::WorkerPidKey, std::to_string(worker->Pid())}});
 
   return RemoveWorker(state.idle, worker);
@@ -309,7 +329,7 @@ void WorkerPool::DisconnectDriver(const std::shared_ptr<Worker> &driver) {
   auto &state = GetStateForLanguage(driver->GetLanguage());
   RAY_CHECK(RemoveWorker(state.registered_drivers, driver));
   stats::CurrentDriver().Record(
-      0, {{stats::LanguageKey, EnumNameLanguage(driver->GetLanguage())},
+      0, {{stats::LanguageKey, Language_Name(driver->GetLanguage())},
           {stats::WorkerPidKey, std::to_string(driver->Pid())}});
 }
 
@@ -381,14 +401,14 @@ void WorkerPool::RecordMetrics() const {
     // Record worker.
     for (auto worker : entry.second.registered_workers) {
       stats::CurrentWorker().Record(
-          worker->Pid(), {{stats::LanguageKey, EnumNameLanguage(worker->GetLanguage())},
+          worker->Pid(), {{stats::LanguageKey, Language_Name(worker->GetLanguage())},
                           {stats::WorkerPidKey, std::to_string(worker->Pid())}});
     }
 
     // Record driver.
     for (auto driver : entry.second.registered_drivers) {
       stats::CurrentDriver().Record(
-          driver->Pid(), {{stats::LanguageKey, EnumNameLanguage(driver->GetLanguage())},
+          driver->Pid(), {{stats::LanguageKey, Language_Name(driver->GetLanguage())},
                           {stats::WorkerPidKey, std::to_string(driver->Pid())}});
     }
   }

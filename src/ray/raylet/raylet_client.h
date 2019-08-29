@@ -1,13 +1,14 @@
 #ifndef RAYLET_CLIENT_H
 #define RAYLET_CLIENT_H
 
+#include <ray/protobuf/gcs.pb.h>
 #include <unistd.h>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "ray/common/status.h"
-#include "ray/raylet/task_spec.h"
+#include "ray/common/task/task_spec.h"
 
 using ray::ActorCheckpointID;
 using ray::ActorID;
@@ -15,7 +16,10 @@ using ray::ClientID;
 using ray::JobID;
 using ray::ObjectID;
 using ray::TaskID;
-using ray::UniqueID;
+using ray::WorkerID;
+
+using ray::Language;
+using ray::rpc::ProfileTableData;
 
 using MessageType = ray::protocol::MessageType;
 using ResourceMappingType =
@@ -68,18 +72,17 @@ class RayletClient {
   /// additional message will be sent to register as one.
   /// \param job_id The ID of the driver. This is non-nil if the client is a driver.
   /// \return The connection information.
-  RayletClient(const std::string &raylet_socket, const ClientID &client_id,
-               bool is_worker, const JobID &job_id, const Language &language);
+  RayletClient(const std::string &raylet_socket, const WorkerID &worker_id,
+               bool is_worker, const JobID &job_id, const Language &language,
+               int port = -1);
 
   ray::Status Disconnect() { return conn_->Disconnect(); };
 
   /// Submit a task using the raylet code path.
   ///
-  /// \param The execution dependencies.
   /// \param The task specification.
   /// \return ray::Status.
-  ray::Status SubmitTask(const std::vector<ObjectID> &execution_dependencies,
-                         const ray::raylet::TaskSpecification &task_spec);
+  ray::Status SubmitTask(const ray::TaskSpecification &task_spec);
 
   /// Get next task for this client. This will block until the scheduler assigns
   /// a task to this worker. The caller takes ownership of the returned task
@@ -87,7 +90,7 @@ class RayletClient {
   ///
   /// \param task_spec The assigned task.
   /// \return ray::Status.
-  ray::Status GetTask(std::unique_ptr<ray::raylet::TaskSpecification> *task_spec);
+  ray::Status GetTask(std::unique_ptr<ray::TaskSpecification> *task_spec);
 
   /// Tell the raylet that the client has finished executing a task.
   ///
@@ -137,7 +140,7 @@ class RayletClient {
   ///
   /// \param profile_events A batch of profiling event information.
   /// \return ray::Status.
-  ray::Status PushProfileEvents(const ProfileTableDataT &profile_events);
+  ray::Status PushProfileEvents(const ProfileTableData &profile_events);
 
   /// Free a list of objects from object stores.
   ///
@@ -175,7 +178,7 @@ class RayletClient {
 
   Language GetLanguage() const { return language_; }
 
-  ClientID GetClientID() const { return client_id_; }
+  WorkerID GetWorkerID() const { return worker_id_; }
 
   JobID GetJobID() const { return job_id_; }
 
@@ -184,7 +187,7 @@ class RayletClient {
   const ResourceMappingType &GetResourceIDs() const { return resource_ids_; }
 
  private:
-  const ClientID client_id_;
+  const WorkerID worker_id_;
   const bool is_worker_;
   const JobID job_id_;
   const Language language_;

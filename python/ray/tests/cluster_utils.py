@@ -8,7 +8,6 @@ import time
 import redis
 
 import ray
-from ray.gcs_utils import ClientTableData
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +62,7 @@ class Cluster(object):
         All nodes are by default started with the following settings:
             cleanup=True,
             num_cpus=1,
-            object_store_memory=100 * (2**20) # 100 MB
+            object_store_memory=150 * 1024 * 1024  # 150 MiB
 
         Args:
             node_args: Keyword arguments used in `start_ray_head` and
@@ -75,7 +74,7 @@ class Cluster(object):
         default_kwargs = {
             "num_cpus": 1,
             "num_gpus": 0,
-            "object_store_memory": 100 * (2**20),  # 100 MB
+            "object_store_memory": 150 * 1024 * 1024,  # 150 MiB
         }
         ray_params = ray.parameter.RayParams(**node_args)
         ray_params.update_if_absent(**default_kwargs)
@@ -175,10 +174,7 @@ class Cluster(object):
         start_time = time.time()
         while time.time() - start_time < timeout:
             clients = ray.state._parse_client_table(redis_client)
-            live_clients = [
-                client for client in clients
-                if client["EntryType"] == ClientTableData.INSERTION
-            ]
+            live_clients = [client for client in clients if client["Alive"]]
 
             expected = len(self.list_all_nodes())
             if len(live_clients) == expected:

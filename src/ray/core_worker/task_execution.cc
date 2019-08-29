@@ -1,89 +1,97 @@
 #include "ray/core_worker/task_execution.h"
 #include "ray/core_worker/context.h"
 #include "ray/core_worker/core_worker.h"
+#include "ray/core_worker/transport/direct_actor_transport.h"
 #include "ray/core_worker/transport/raylet_transport.h"
 
 namespace ray {
 
 CoreWorkerTaskExecutionInterface::CoreWorkerTaskExecutionInterface(
-    WorkerContext &worker_context, RayletClient &raylet_client,
-    CoreWorkerObjectInterface &object_interface)
-    : worker_context_(worker_context), object_interface_(object_interface) {
-  task_receivers.emplace(static_cast<int>(TaskTransportType::RAYLET),
-                         std::unique_ptr<CoreWorkerRayletTaskReceiver>(
-                             new CoreWorkerRayletTaskReceiver(raylet_client)));
+    WorkerContext &worker_context, std::unique_ptr<RayletClient> &raylet_client,
+    CoreWorkerObjectInterface &object_interface, const TaskExecutor &executor)
+    : worker_context_(worker_context),
+      object_interface_(object_interface),
+      execution_callback_(executor),
+      worker_server_("Worker", 0 /* let grpc choose port */),
+      main_service_(std::make_shared<boost::asio::io_service>()),
+      main_work_(*main_service_) {
+  RAY_CHECK(execution_callback_ != nullptr);
+
+  auto func = std::bind(&CoreWorkerTaskExecutionInterface::ExecuteTask, this,
+                        std::placeholders::_1, std::placeholders::_2);
+  task_receivers_.emplace(
+      TaskTransportType::RAYLET,
+      std::unique_ptr<CoreWorkerRayletTaskReceiver>(new CoreWorkerRayletTaskReceiver(
+          raylet_client, object_interface_, *main_service_, worker_server_, func)));
+  task_receivers_.emplace(
+      TaskTransportType::DIRECT_ACTOR,
+      std::unique_ptr<CoreWorkerDirectActorTaskReceiver>(
+          new CoreWorkerDirectActorTaskReceiver(object_interface_, *main_service_,
+                                                worker_server_, func)));
+
+  // Start RPC server after all the task receivers are properly initialized.
+  worker_server_.Run();
 }
 
-Status CoreWorkerTaskExecutionInterface::Run(const TaskExecutor &executor) {
-  while (true) {
-    std::vector<TaskSpec> tasks;
-    auto status =
-        task_receivers[static_cast<int>(TaskTransportType::RAYLET)]->GetTasks(&tasks);
-    if (!status.ok()) {
-      RAY_LOG(ERROR) << "Getting task failed with error: "
-                     << ray::Status::IOError(status.message());
-      return status;
-    }
+Status CoreWorkerTaskExecutionInterface::ExecuteTask(
+    const TaskSpecification &task_spec,
+    std::vector<std::shared_ptr<RayObject>> *results) {
+  RAY_LOG(DEBUG) << "Executing task " << task_spec.TaskId();
 
-    for (const auto &task : tasks) {
-      const auto &spec = task.GetTaskSpecification();
-      worker_context_.SetCurrentTask(spec);
+  worker_context_.SetCurrentTask(task_spec);
 
-      RayFunction func{spec.GetLanguage(), spec.FunctionDescriptor()};
+  RayFunction func{task_spec.GetLanguage(), task_spec.FunctionDescriptor()};
 
-      std::vector<std::shared_ptr<RayObject>> args;
-      RAY_CHECK_OK(BuildArgsForExecutor(spec, &args));
+  std::vector<std::shared_ptr<RayObject>> args;
+  RAY_CHECK_OK(BuildArgsForExecutor(task_spec, &args));
 
-      TaskType task_type;
-      if (spec.IsActorCreationTask()) {
-        task_type = TaskType::ACTOR_CREATION_TASK;
-      } else if (spec.IsActorTask()) {
-        task_type = TaskType::ACTOR_TASK;
-      } else {
-        task_type = TaskType::NORMAL_TASK;
-      }
-
-      TaskInfo task_info{spec.TaskId(), spec.JobId(), task_type};
-
-      auto num_returns = spec.NumReturns();
-      if (spec.IsActorCreationTask() || spec.IsActorTask()) {
-        RAY_CHECK(num_returns > 0);
-        // Decrease to account for the dummy object id.
-        num_returns--;
-      }
-
-      status = executor(func, args, task_info, num_returns);
-      // TODO(zhijunfu):
-      // 1. Check and handle failure.
-      // 2. Save or load checkpoint.
-    }
+  auto num_returns = task_spec.NumReturns();
+  if (task_spec.IsActorCreationTask() || task_spec.IsActorTask()) {
+    RAY_CHECK(num_returns > 0);
+    // Decrease to account for the dummy object id.
+    num_returns--;
   }
 
-  // should never reach here.
-  return Status::OK();
+  auto status = execution_callback_(func, args, num_returns, results);
+  // TODO(zhijunfu):
+  // 1. Check and handle failure.
+  // 2. Save or load checkpoint.
+  return status;
+}
+
+void CoreWorkerTaskExecutionInterface::Run() {
+  // Run main IO service.
+  main_service_->run();
+}
+
+void CoreWorkerTaskExecutionInterface::Stop() {
+  // Stop main IO service.
+  std::shared_ptr<boost::asio::io_service> main_service = main_service_;
+  // Delay the execution of io_service::stop() to avoid deadlock if
+  // CoreWorkerTaskExecutionInterface::Stop is called inside a task.
+  main_service_->post([main_service]() { main_service->stop(); });
 }
 
 Status CoreWorkerTaskExecutionInterface::BuildArgsForExecutor(
-    const raylet::TaskSpecification &spec,
-    std::vector<std::shared_ptr<RayObject>> *args) {
-  auto num_args = spec.NumArgs();
+    const TaskSpecification &task, std::vector<std::shared_ptr<RayObject>> *args) {
+  auto num_args = task.NumArgs();
   (*args).resize(num_args);
 
   std::vector<ObjectID> object_ids_to_fetch;
   std::vector<int> indices;
 
-  for (int i = 0; i < spec.NumArgs(); ++i) {
-    int count = spec.ArgIdCount(i);
+  for (size_t i = 0; i < task.NumArgs(); ++i) {
+    int count = task.ArgIdCount(i);
     if (count > 0) {
       // pass by reference.
       RAY_CHECK(count == 1);
-      object_ids_to_fetch.push_back(spec.ArgId(i, 0));
+      object_ids_to_fetch.push_back(task.ArgId(i, 0));
       indices.push_back(i);
     } else {
       // pass by value.
       (*args)[i] = std::make_shared<RayObject>(
-          std::make_shared<LocalMemoryBuffer>(const_cast<uint8_t *>(spec.ArgVal(i)),
-                                              spec.ArgValLength(i)),
+          std::make_shared<LocalMemoryBuffer>(const_cast<uint8_t *>(task.ArgVal(i)),
+                                              task.ArgValLength(i)),
           nullptr);
     }
   }

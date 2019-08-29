@@ -1,6 +1,7 @@
 package org.ray.runtime.config;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigException;
@@ -10,10 +11,10 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import org.ray.api.id.UniqueId;
+import org.ray.api.id.JobId;
+import org.ray.runtime.generated.Common.WorkerType;
 import org.ray.runtime.util.NetworkUtil;
 import org.ray.runtime.util.ResourceUtil;
-import org.ray.runtime.util.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,10 +30,10 @@ public class RayConfig {
   public static final String CUSTOM_CONFIG_FILE = "ray.conf";
 
   public final String nodeIp;
-  public final WorkerMode workerMode;
+  public final WorkerType workerMode;
   public final RunMode runMode;
   public final Map<String, Double> resources;
-  public final UniqueId jobId;
+  private JobId jobId;
   public final String logDir;
   public final boolean redirectOutput;
   public final List<String> libraryPath;
@@ -62,7 +63,7 @@ public class RayConfig {
   public final int numberExecThreadsForDevRuntime;
 
   private void validate() {
-    if (workerMode == WorkerMode.WORKER) {
+    if (workerMode == WorkerType.WORKER) {
       Preconditions.checkArgument(redisAddress != null,
           "Redis address must be set in worker mode.");
     }
@@ -78,14 +79,14 @@ public class RayConfig {
 
   public RayConfig(Config config) {
     // Worker mode.
-    WorkerMode localWorkerMode;
+    WorkerType localWorkerMode;
     try {
-      localWorkerMode = config.getEnum(WorkerMode.class, "ray.worker.mode");
+      localWorkerMode = config.getEnum(WorkerType.class, "ray.worker.mode");
     } catch (ConfigException.Missing e) {
-      localWorkerMode = WorkerMode.DRIVER;
+      localWorkerMode = WorkerType.DRIVER;
     }
     workerMode = localWorkerMode;
-    boolean isDriver = workerMode == WorkerMode.DRIVER;
+    boolean isDriver = workerMode == WorkerType.DRIVER;
     // Run mode.
     runMode = config.getEnum(RunMode.class, "ray.run-mode");
     // Node ip.
@@ -108,9 +109,9 @@ public class RayConfig {
     // Job id.
     String jobId = config.getString("ray.job.id");
     if (!jobId.isEmpty()) {
-      this.jobId = UniqueId.fromHexString(jobId);
+      this.jobId = JobId.fromHexString(jobId);
     } else {
-      this.jobId = UniqueId.randomId();
+      this.jobId = JobId.NIL;
     }
     // Log dir.
     logDir = removeTrailingSlash(config.getString("ray.log-dir"));
@@ -198,6 +199,14 @@ public class RayConfig {
     return redisPort;
   }
 
+  public void setJobId(JobId jobId) {
+    this.jobId = jobId;
+  }
+
+  public JobId getJobId() {
+    return this.jobId;
+  }
+
   @Override
   public String toString() {
     return "RayConfig{"
@@ -235,7 +244,7 @@ public class RayConfig {
     ConfigFactory.invalidateCaches();
     Config config = ConfigFactory.systemProperties();
     String configPath = System.getProperty("ray.config");
-    if (StringUtil.isNullOrEmpty(configPath)) {
+    if (Strings.isNullOrEmpty(configPath)) {
       LOGGER.info("Loading config from \"ray.conf\" file in classpath.");
       config = config.withFallback(ConfigFactory.load(CUSTOM_CONFIG_FILE));
     } else {

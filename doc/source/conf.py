@@ -28,6 +28,7 @@ MOCK_MODULES = [
     "scipy",
     "scipy.signal",
     "scipy.stats",
+    "tensorflow_probability",
     "tensorflow",
     "tensorflow.contrib",
     "tensorflow.contrib.all_reduce",
@@ -69,6 +70,7 @@ extensions = [
     'sphinx.ext.viewcode',
     'sphinx.ext.napoleon',
     'sphinx_click.ext',
+    'sphinx-jsonschema',
 ]
 
 # Add any paths that contain templates here, relative to this directory.
