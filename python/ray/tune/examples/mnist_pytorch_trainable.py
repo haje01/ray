@@ -58,6 +58,7 @@ class TrainMNIST(tune.Trainable):
     def _restore(self, checkpoint_path):
         self.model.load_state_dict(torch.load(checkpoint_path))
 
+
 # __trainable_example_end__
 # yapf: enable
 
