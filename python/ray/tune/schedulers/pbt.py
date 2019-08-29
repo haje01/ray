@@ -250,7 +250,7 @@ class PopulationBasedTraining(FIFOScheduler):
 
     def _log_config_on_step(self, trial_state, new_state, trial,
                             trial_to_clone, new_config):
-        """Logs transition during exploit/exploit step.
+        """Logs transition during exploit/explore step.
 
         For each step, logs: [target trial tag, clone trial tag, target trial
         iteration, clone trial iteration, old config, new config].
